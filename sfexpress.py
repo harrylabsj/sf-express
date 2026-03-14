@@ -470,13 +470,20 @@ async def main():
         if args.action == 'info':
             print_privacy_info()
         elif args.action == 'clear':
-            secure_storage.clear_all()
-            print("✅ 已清除所有个人数据")
+            clear_local_data()
+            print("✅ 已清除本地 SQLite 历史/订阅数据，以及加密存储文件")
         elif args.action == 'export':
-            info = secure_storage.get_storage_info()
+            storage = get_secure_storage()
+            info = storage.get_storage_info()
             export_file = CONFIG_DIR / 'privacy_export.json'
+            payload = {
+                'config_dir': str(CONFIG_DIR),
+                'db_file': str(DB_FILE),
+                'db_exists': DB_FILE.exists(),
+                'secure_storage': info,
+            }
             with open(export_file, 'w') as f:
-                json.dump(info, f, indent=2)
+                json.dump(payload, f, indent=2)
             print(f"✅ 已导出到: {export_file}")
         return
     
