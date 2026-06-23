@@ -1,6 +1,7 @@
 ---
 name: sf-express
-description: Use SF Express (顺丰速运) for shipment tracking, shipping guidance, service-type comparison, outlet lookup, and delivery-time or fee estimation. Use when the user asks about 顺丰、顺丰单号查询、寄快递、顺丰时效、顺丰运费、顺丰网点, or wants practical help understanding or managing an SF Express shipment. This skill may persist local user data for history and subscriptions when its runtime code is used.
+version: 1.1.1
+description: Use SF Express (顺丰速运) for shipment tracking, delivery anomaly triage, e-commerce seller/customer handoffs, shipping guidance, service-type comparison, outlet lookup, and delivery-time or fee estimation. Use when the user asks about 顺丰、顺丰单号查询、物流异常、包裹停滞、异常签收、寄快递、顺丰时效、顺丰运费、顺丰网点, or wants practical help understanding or managing an SF Express shipment. This skill may persist local user data for history and subscriptions when its runtime code is used.
 ---
 
 # SF Express
@@ -8,6 +9,35 @@ description: Use SF Express (顺丰速运) for shipment tracking, shipping guida
 ## Overview
 
 Use this skill to help users with common SF Express tasks such as tracking shipments, understanding service levels, estimating timing or fees, and preparing to send a parcel.
+
+## E-commerce Logistics Triage Workflow
+
+For marketplace, merchant, or after-sales questions, start with triage before giving a recommendation:
+
+1. Identify the actor: buyer, seller, customer-support agent, or operations owner.
+2. Classify the latest tracking state:
+   - **No first scan**: label created but not picked up.
+   - **Line-haul stall**: no update after trunk departure or arrival.
+   - **Transit delay**: moving but beyond the promised or typical window.
+   - **Customs/security hold**: inspection, quarantine, or restricted-item review.
+   - **Out for delivery risk**: repeated failed delivery or unreachable recipient.
+   - **Abnormal signed**: signed by unknown person, wrong location, or user denies receipt.
+   - **Return/reverse logistics**: package routed back to sender or after-sales address.
+3. Give a buyer/seller handoff:
+   - Buyer: what to check, what evidence to save, when to contact SF or the merchant.
+   - Seller: order id, tracking id, promise window, refund/reship threshold, customer message draft.
+4. State uncertainty. Do not promise arrival times unless live SF data or user-provided carrier data supports it.
+5. Redact personal data in shared summaries: show partial phone/address/tracking details when possible.
+
+Use this compact output for anomalies:
+
+```text
+Status: <normal | watch | delayed | abnormal | needs user action>
+Evidence: <latest scan + timestamp + route>
+Likely cause: <one or two cautious possibilities>
+Next action: <buyer step / seller step>
+Escalate if: <time threshold or status trigger>
+```
 
 ## Local Persistence
 
