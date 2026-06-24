@@ -7,22 +7,15 @@ import json
 import os
 import re
 import sqlite3
-import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional, Dict
+from urllib.parse import urlencode, urlparse
+from urllib.request import Request, urlopen
 
-import aiohttp
-
-# 安全存储
-try:
-    from security import SecureStorage
-except ImportError:
-    print("请安装加密库: pip install cryptography")
-    sys.exit(1)
-
-secure_storage = SecureStorage(app_name="sf-express")
+_secure_storage: Optional[object] = None
+LOCAL_ENDPOINT_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 # 配置
 CONFIG_DIR = Path.home() / ".openclaw" / "data" / "sf-express"
@@ -64,6 +57,7 @@ class TrackingResult:
     last_updated: Optional[str] = None
     sender: Optional[str] = None
     receiver: Optional[str] = None
+    source: str = "unknown"
 
 
 @dataclass
@@ -93,7 +87,6 @@ class SFExpressClient:
     
     def __init__(self):
         self.db = self._init_db()
-        self.session: Optional[aiohttp.ClientSession] = None
     
     def _init_db(self) -> sqlite3.Connection:
         """初始化数据库"""
@@ -139,53 +132,136 @@ class SFExpressClient:
         return conn
     
     async def __aenter__(self):
-        self.session = aiohttp.ClientSession()
         return self
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.session:
-            await self.session.close()
+        self.db.close()
     
     def is_sf_number(self, tracking_number: str) -> bool:
         """检查是否为顺丰单号"""
         return bool(re.match(SF_PATTERN, tracking_number.upper()))
     
-    async def query(self, tracking_number: str) -> TrackingResult:
+    async def query(self, tracking_number: str, allow_mock: bool = False) -> TrackingResult:
         """查询物流信息"""
         if not self.is_sf_number(tracking_number):
             raise ValueError(f"{tracking_number} 不是有效的顺丰单号")
-        
-        # 模拟查询结果
+
+        endpoint = os.environ.get("SF_EXPRESS_TRACKING_ENDPOINT", "").strip()
+        if endpoint:
+            result = await self._query_live_endpoint(tracking_number, endpoint)
+            self._save_history(result)
+            return result
+
+        if not allow_mock:
+            raise RuntimeError(
+                "未配置真实顺丰查询端点。请设置 SF_EXPRESS_TRACKING_ENDPOINT，"
+                "或仅在演示/测试时加 --mock 使用明确标记的模拟数据。"
+            )
+
+        # 显式模拟结果。只能在 --mock 下使用，不能冒充真实顺丰轨迹。
         result = TrackingResult(
             tracking_number=tracking_number,
-            product_name="顺丰标快",
-            status="in_transit",
+            product_name="顺丰标快（模拟）",
+            status="mock_in_transit",
             events=[
                 TrackingEvent(
                     time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    description="快件已到达【北京顺义集散中心】",
+                    description="模拟事件：快件已到达【北京顺义集散中心】",
                     location="北京市",
-                    status="in_transit"
+                    status="mock_in_transit"
                 ),
                 TrackingEvent(
                     time=(datetime.now() - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S"),
-                    description="快件已从【上海虹桥集散中心】发出",
+                    description="模拟事件：快件已从【上海虹桥集散中心】发出",
                     location="上海市",
-                    status="in_transit"
+                    status="mock_in_transit"
                 ),
             ],
             estimated_delivery=(datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d"),
             last_updated=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             sender="上海市",
-            receiver="北京市"
+            receiver="北京市",
+            source="mock"
         )
-        
+
         self._save_history(result)
         return result
-    
-    async def batch_query(self, tracking_numbers: List[str]) -> List[TrackingResult]:
+
+    async def _query_live_endpoint(self, tracking_number: str, endpoint: str) -> TrackingResult:
+        """Query a user-configured live endpoint.
+
+        The endpoint may contain `{tracking_number}` or accept `tracking_number`
+        as a query parameter. The response must be JSON with either a top-level
+        `events` list or a `data.events` list.
+        """
+        if "{tracking_number}" in endpoint:
+            url = endpoint.replace("{tracking_number}", tracking_number)
+        else:
+            separator = "&" if "?" in endpoint else "?"
+            url = endpoint + separator + urlencode({"tracking_number": tracking_number})
+
+        self._validate_live_endpoint_url(url)
+        try:
+            payload = await asyncio.to_thread(self._fetch_live_json, url)
+        except Exception as exc:
+            raise RuntimeError(f"真实顺丰查询端点请求失败: {exc}") from exc
+
+        data = payload.get("data", payload) if isinstance(payload, dict) else {}
+        events_raw = data.get("events") if isinstance(data, dict) else None
+        if not isinstance(events_raw, list):
+            raise RuntimeError("真实查询端点返回格式无效：缺少 events 列表")
+
+        events: List[TrackingEvent] = []
+        for item in events_raw:
+            if not isinstance(item, dict):
+                continue
+            events.append(TrackingEvent(
+                time=str(item.get("time") or item.get("timestamp") or ""),
+                description=str(item.get("description") or item.get("desc") or item.get("status") or ""),
+                location=str(item.get("location") or ""),
+                status=str(item.get("status") or data.get("status") or "unknown"),
+            ))
+
+        if not events:
+            raise RuntimeError("真实查询端点返回格式无效：events 为空")
+
+        return TrackingResult(
+            tracking_number=str(data.get("tracking_number") or tracking_number),
+            product_name=str(data.get("product_name") or data.get("product") or "顺丰"),
+            status=str(data.get("status") or events[0].status or "unknown"),
+            events=events,
+            estimated_delivery=data.get("estimated_delivery"),
+            last_updated=str(data.get("last_updated") or datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+            sender=data.get("sender"),
+            receiver=data.get("receiver"),
+            source="live_endpoint",
+        )
+
+    def _validate_live_endpoint_url(self, url: str) -> None:
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise RuntimeError("SF_EXPRESS_TRACKING_ENDPOINT 必须是绝对 http(s) URL")
+        if parsed.scheme == "https":
+            return
+        if parsed.hostname in LOCAL_ENDPOINT_HOSTS:
+            return
+        raise RuntimeError("真实查询端点必须使用 HTTPS；HTTP 仅允许 127.0.0.1/localhost 本地开发")
+
+    def _fetch_live_json(self, url: str) -> Dict:
+        request = Request(
+            url,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "sf-express-skill/1.1.2",
+            },
+        )
+        with urlopen(request, timeout=10) as response:
+            charset = response.headers.get_content_charset() or "utf-8"
+            return json.loads(response.read().decode(charset))
+
+    async def batch_query(self, tracking_numbers: List[str], allow_mock: bool = False) -> List[TrackingResult]:
         """批量查询"""
-        tasks = [self.query(number) for number in tracking_numbers]
+        tasks = [self.query(number, allow_mock=allow_mock) for number in tracking_numbers]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         return [r for r in results if not isinstance(r, Exception)]
     
@@ -303,8 +379,13 @@ class SFExpressClient:
     
     def format_tracking_result(self, result: TrackingResult) -> str:
         """格式化查询结果"""
+        source_label = {
+            "live_endpoint": "真实查询端点",
+            "mock": "模拟演示数据（非真实物流）",
+        }.get(result.source, result.source)
         lines = [
             f"📦 顺丰速运 ({result.tracking_number})",
+            f"数据来源: {source_label}",
             f"产品: {result.product_name}",
             f"状态: {self._format_status(result.status)}",
             f"预计送达: {result.estimated_delivery or '未知'}",
@@ -342,6 +423,7 @@ class SFExpressClient:
             'pending': '⏳ 待揽收',
             'picked_up': '📦 已揽收',
             'in_transit': '🚚 运输中',
+            'mock_in_transit': '🚚 模拟运输中',
             'delivered': '✅ 已签收',
             'exception': '⚠️ 异常',
         }
@@ -390,7 +472,7 @@ def print_subscriptions(client: SFExpressClient):
 
 def print_privacy_info():
     """打印隐私信息"""
-    info = secure_storage.get_storage_info()
+    info = get_secure_storage().get_storage_info()
     print("存储信息:\n")
     print(f"存储目录: {info['base_dir']}")
     print(f"文件数量: {info['total_files']}\n")
@@ -401,6 +483,43 @@ def print_privacy_info():
             print(f"  - {f['name']} ({f['size']} bytes, 权限: {f['permissions']})")
 
 
+def get_secure_storage():
+    """Lazily initialize encrypted storage to avoid creating key files on import."""
+    global _secure_storage
+    if _secure_storage is None:
+        try:
+            from security import SecureStorage
+        except ImportError as exc:
+            raise RuntimeError("隐私加密功能需要 cryptography，请先安装 requirements.txt") from exc
+        _secure_storage = SecureStorage(app_name="sf-express")
+    return _secure_storage
+
+
+def clear_local_data() -> Dict[str, int]:
+    """Clear local SQLite records and encrypted storage files."""
+    removed = {"history": 0, "subscriptions": 0, "addresses": 0, "secure_files": 0}
+    if DB_FILE.exists():
+        conn = sqlite3.connect(str(DB_FILE))
+        try:
+            cursor = conn.cursor()
+            for table in ("history", "subscriptions", "addresses"):
+                cursor.execute(f"SELECT COUNT(*) FROM {table}")
+                removed[table] = int(cursor.fetchone()[0])
+                cursor.execute(f"DELETE FROM {table}")
+            conn.commit()
+        finally:
+            conn.close()
+
+    storage = get_secure_storage()
+    removed["secure_files"] = len(storage.list_files())
+    storage.clear_all()
+
+    export_file = CONFIG_DIR / "privacy_export.json"
+    if export_file.exists():
+        export_file.unlink()
+    return removed
+
+
 async def main():
     parser = argparse.ArgumentParser(description='顺丰速运助手')
     subparsers = parser.add_subparsers(dest='command', help='可用命令')
@@ -408,10 +527,14 @@ async def main():
     # 单号查询
     query_parser = subparsers.add_parser('query', help='查询顺丰快递')
     query_parser.add_argument('tracking_number', help='顺丰单号')
+    query_parser.add_argument('--mock', action='store_true',
+                              help='使用明确标记的模拟数据；默认不伪造实时轨迹')
     
     # 批量查询
     batch_parser = subparsers.add_parser('batch', help='批量查询')
     batch_parser.add_argument('tracking_numbers', nargs='+', help='顺丰单号列表')
+    batch_parser.add_argument('--mock', action='store_true',
+                              help='使用明确标记的模拟数据；默认不伪造实时轨迹')
     
     # 时效查询
     time_parser = subparsers.add_parser('time', help='时效预估')
@@ -467,24 +590,31 @@ async def main():
     
     # 隐私控制
     if args.command == 'privacy':
-        if args.action == 'info':
-            print_privacy_info()
-        elif args.action == 'clear':
-            clear_local_data()
-            print("✅ 已清除本地 SQLite 历史/订阅数据，以及加密存储文件")
-        elif args.action == 'export':
-            storage = get_secure_storage()
-            info = storage.get_storage_info()
-            export_file = CONFIG_DIR / 'privacy_export.json'
-            payload = {
-                'config_dir': str(CONFIG_DIR),
-                'db_file': str(DB_FILE),
-                'db_exists': DB_FILE.exists(),
-                'secure_storage': info,
-            }
-            with open(export_file, 'w') as f:
-                json.dump(payload, f, indent=2)
-            print(f"✅ 已导出到: {export_file}")
+        try:
+            if args.action == 'info':
+                print_privacy_info()
+            elif args.action == 'clear':
+                removed = clear_local_data()
+                print(
+                    "✅ 已清除本地数据: "
+                    f"history={removed['history']}, subscriptions={removed['subscriptions']}, "
+                    f"addresses={removed['addresses']}, secure_files={removed['secure_files']}"
+                )
+            elif args.action == 'export':
+                storage = get_secure_storage()
+                info = storage.get_storage_info()
+                export_file = CONFIG_DIR / 'privacy_export.json'
+                payload = {
+                    'config_dir': str(CONFIG_DIR),
+                    'db_file': str(DB_FILE),
+                    'db_exists': DB_FILE.exists(),
+                    'secure_storage': info,
+                }
+                with open(export_file, 'w') as f:
+                    json.dump(payload, f, indent=2)
+                print(f"✅ 已导出到: {export_file}")
+        except RuntimeError as e:
+            print(f"❌ {e}")
         return
     
     # 初始化客户端
@@ -492,14 +622,14 @@ async def main():
         # 单号查询
         if args.command == 'query':
             try:
-                result = await client.query(args.tracking_number)
+                result = await client.query(args.tracking_number, allow_mock=args.mock)
                 print(client.format_tracking_result(result))
             except Exception as e:
                 print(f"❌ 查询失败: {e}")
         
         # 批量查询
         elif args.command == 'batch':
-            results = await client.batch_query(args.tracking_numbers)
+            results = await client.batch_query(args.tracking_numbers, allow_mock=args.mock)
             for result in results:
                 print(client.format_tracking_result(result))
                 print("\n" + "="*50 + "\n")

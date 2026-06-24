@@ -1,6 +1,6 @@
 ---
 name: sf-express
-version: 1.1.1
+version: 1.1.2
 description: Use SF Express (顺丰速运) for shipment tracking, delivery anomaly triage, e-commerce seller/customer handoffs, shipping guidance, service-type comparison, outlet lookup, and delivery-time or fee estimation. Use when the user asks about 顺丰、顺丰单号查询、物流异常、包裹停滞、异常签收、寄快递、顺丰时效、顺丰运费、顺丰网点, or wants practical help understanding or managing an SF Express shipment. This skill may persist local user data for history and subscriptions when its runtime code is used.
 ---
 
@@ -9,6 +9,26 @@ description: Use SF Express (顺丰速运) for shipment tracking, delivery anoma
 ## Overview
 
 Use this skill to help users with common SF Express tasks such as tracking shipments, understanding service levels, estimating timing or fees, and preparing to send a parcel.
+
+## Live Data and Demo Boundary
+
+The bundled CLI must not fabricate live SF Express tracking.
+
+- Real tracking requires a user-configured live endpoint through `SF_EXPRESS_TRACKING_ENDPOINT`.
+- Remote live endpoints must use HTTPS; plain HTTP is accepted only for `127.0.0.1` or `localhost` development.
+- If no endpoint is configured, `query` and `batch` fail safely instead of returning made-up logistics events.
+- Demo data is still available for onboarding and tests, but only with `--mock`; every mock result is labelled `模拟演示数据（非真实物流）`.
+- Do not describe mock output as live carrier data, proof of delivery, or an ETA.
+
+Examples:
+
+```bash
+# Live endpoint path; endpoint may use {tracking_number} or a tracking_number query param
+SF_EXPRESS_TRACKING_ENDPOINT="https://example.internal/sf/{tracking_number}" python3 sfexpress.py query SF1234567890
+
+# Explicit demo path
+python3 sfexpress.py query SF1234567890 --mock
+```
 
 ## E-commerce Logistics Triage Workflow
 
@@ -61,7 +81,7 @@ Only use persistence when it is necessary for the user's requested workflow. If 
 The local CLI supports privacy operations:
 
 - `privacy info` — show local storage paths and stored-file info
-- `privacy clear` — clear local SQLite history/subscription data and encrypted local files
+- `privacy clear` — clear local SQLite history/subscription/address data, encrypted local files, and prior privacy exports
 - `privacy export` — export local storage metadata to `privacy_export.json`
 
 ## Workflow
@@ -87,8 +107,8 @@ The local CLI supports privacy operations:
 
 ### 场景 A：查快递
 1. **告诉我单号** — 如 "SF1234567890"
-2. **获取物流状态** — 实时轨迹 + 预计到达时间
-3. **可选操作** — 订阅更新 / 查历史记录
+2. **确认数据来源** — 真实端点、用户提供轨迹，或明确 `--mock` 演示
+3. **获取物流状态** — 轨迹 + 谨慎 ETA + 异常分诊
 
 > 示例："查一下顺丰单号 SF1234567890 到哪了"
 
@@ -113,8 +133,9 @@ The local CLI supports privacy operations:
 ```
 📍 快递追踪：SF1234567890
 
+数据来源：真实查询端点（或用户提供轨迹）
 当前状态：正在派送中
-预计到达：今天（6月16日）18:00前
+预计到达：以顺丰实时页面/端点为准；当前建议按今天 18:00 前观察
 
 📦 完整轨迹：
 06-16 08:30 | 北京朝阳区CBD营业部 | 派送中
@@ -122,7 +143,7 @@ The local CLI supports privacy operations:
 06-15 22:30 | 上海浦东集散中心 | 已发出
 06-15 18:00 | 上海浦东新区营业部 | 已揽收
 
-📞 如需更改配送：可联系派件员 138****1234
+下一步：如需更改配送，请在顺丰官方渠道或派件员来电后由用户本人操作。
 ```
 
 ### 示例 2：运费估算
@@ -233,7 +254,7 @@ The local CLI supports privacy operations:
 
 | 场景 | 用户输入示例 | 技能输出要点 |
 |------|-------------|-------------|
-| **查快递** | "我买的东西寄出来了，SF9876543210到了没？" | 显示完整物流轨迹 → 当前状态 → 预计到达时间 → 派件员联系方式 |
+| **查快递** | "我买的东西寄出来了，SF9876543210到了没？" | 先确认真实端点/用户提供轨迹 → 显示轨迹和当前状态 → 给出谨慎 ETA 与异常分诊 |
 | **算运费** | "深圳到北京寄10公斤书多少钱？" | 标快/特快价格对比 → 提示超重可能分段计费 → 建议打包方式省运费 |
 | **找网点** | "附近哪里有顺丰可以寄快递？我在上海徐汇" | 列出附近营业部/服务点/自助柜 → 含地址电话营业时间 → 推荐最近最方便的 |
 | **选服务** | "我要寄护照到美国，用顺丰国际怎么操作？" | 国际件服务介绍 → 所需材料清单 → 清关提示 → 预估时效（5-7工作日） |
